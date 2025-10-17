@@ -19,11 +19,23 @@ export function TimeSeries({ data }: { data: { x: string | number; y: number }[]
   );
 }
 
-export function StackedBars({ series }: { series: { key: string; data: { x: string | number; y: number }[] }[] }) {
-  const xs = series[0]?.data.map(d => d.x) || [];
-  const rows = xs.map((x, i) =>
-    series.reduce((acc, s) => ({ ...acc, x, [s.key]: s.data[i]?.y ?? 0 }), {} as any)
-  );
+type SeriesPoint = { x: string | number; y: number };
+type Series = { key: string; data: SeriesPoint[] };
+
+// 🔧 Row: permitimos 'x' como string y demás claves numéricas
+type Row = { [key: string]: number | string };
+
+export function StackedBars({ series }: { series: Series[] }) {
+  const xs = series[0]?.data.map(d => d.x) ?? [];
+
+  const rows: Row[] = xs.map((x, i) => {
+    const acc: Row = { x: String(x) }; // normalizamos x a string para el eje
+    for (const s of series) {
+      acc[s.key] = s.data[i]?.y ?? 0;
+    }
+    return acc;
+  });
+
   return (
     <div style={{ width: '100%', height: 260 }}>
       <ResponsiveContainer>

@@ -1,6 +1,6 @@
 'use client';
 import { useEffect, useMemo, useState } from 'react';
-import { collection, onSnapshot, orderBy, query, where } from 'firebase/firestore';
+import { collection, onSnapshot, orderBy, query, where, DocumentData } from 'firebase/firestore';
 import { db } from '@/lib/firebase';
 import { format } from 'date-fns';
 import { KpiCard } from '@/components/KpiCard';
@@ -10,6 +10,12 @@ function today() {
   return format(new Date(), 'yyyy-MM-dd');
 }
 
+// Tipo mínimo para lo que lees en cajaDiaria
+type MovimientoDoc = {
+  tipo?: 'apertura' | 'abono' | 'gasto' | 'ingreso' | 'retiro' | 'prestamo';
+  monto?: number | string;
+};
+
 export default function Dashboard() {
   const [kpi, setKpi] = useState({
     cobrado: 0, prestado: 0, gastos: 0, ingresos: 0, retiros: 0, inicial: 0, morosidadPct: 0,
@@ -17,7 +23,7 @@ export default function Dashboard() {
 
   const from = today();
   const to = today();
-  const tenantId = 'TENANT_DEMO'; // TODO: reemplazar por tu tenant real
+  const tenantId = 'TENANT_DEMO';
 
   useEffect(() => {
     const q = query(
@@ -30,14 +36,16 @@ export default function Dashboard() {
     const unsub = onSnapshot(q, (snap) => {
       let cobrado = 0, prestado = 0, gastos = 0, ingresos = 0, retiros = 0, inicial = 0;
       snap.forEach((d) => {
-        const it = d.data() as any;
+        const it = d.data() as DocumentData as MovimientoDoc; // 👈 sin any
+        const monto = Number(it.monto ?? 0);
         switch (it.tipo) {
-          case 'apertura': inicial += Number(it.monto || 0); break;
-          case 'abono': cobrado += Number(it.monto || 0); break;
-          case 'gasto': gastos += Number(it.monto || 0); break;
-          case 'ingreso': ingresos += Number(it.monto || 0); break;
-          case 'retiro': retiros += Number(it.monto || 0); break;
-          case 'prestamo': prestado += Number(it.monto || 0); break;
+          case 'apertura': inicial += monto; break;
+          case 'abono': cobrado += monto; break;
+          case 'gasto': gastos += monto; break;
+          case 'ingreso': ingresos += monto; break;
+          case 'retiro': retiros += monto; break;
+          case 'prestamo': prestado += monto; break;
+          default: break;
         }
       });
       setKpi({ cobrado, prestado, gastos, ingresos, retiros, inicial, morosidadPct: 0 });
