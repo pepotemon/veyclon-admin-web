@@ -22,11 +22,31 @@ async function requireAdmin(req: NextRequest) {
   if (!token) throw new Error('No token');
 
   const decoded = await adminAuth.verifyIdToken(token, true);
-  const role = decoded.role as Role | undefined;
-  const tenantId = decoded.tenantId as string | undefined;
+  let role = decoded.role as Role | undefined;
+  let tenantId = decoded.tenantId as string | undefined;
+  const uid = decoded.uid;
 
-  if (!role || !['admin', 'superadmin'].includes(role)) throw new Error('forbidden');
-  return { uid: decoded.uid, role, tenantId };
+  // Si no hay claims, tratar de leer perfil Firestore
+  if (!role || !tenantId) {
+    const snap = await adminDb.collection('usuarios').doc(uid).get();
+    if (snap.exists) {
+      const data = snap.data() as { role?: Role; tenantId?: string };
+      role = role ?? data.role;
+      tenantId = tenantId ?? data.tenantId;
+
+      // Si encontramos rol/tenant válidos y el rol es admin/superadmin,
+      // subimos los claims para futuros requests (se refrescan al re-login)
+      if (role && tenantId && (role === 'admin' || role === 'superadmin')) {
+        await adminAuth.setCustomUserClaims(uid, { role, tenantId });
+      }
+    }
+  }
+
+  if (!role || !tenantId || !['admin', 'superadmin'].includes(role)) {
+    throw new Error('forbidden');
+  }
+
+  return { uid, role, tenantId };
 }
 
 export async function POST(req: NextRequest) {
