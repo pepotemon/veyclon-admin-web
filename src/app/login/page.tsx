@@ -1,23 +1,23 @@
 'use client';
+import { Suspense, useState } from 'react';
+import { useSearchParams, useRouter } from 'next/navigation';
 import { signInWithEmailAndPassword } from 'firebase/auth';
 import { auth } from '@/lib/firebase';
-import { useState } from 'react';
-import { useRouter, useSearchParams } from 'next/navigation';
 
-export default function Login(){
+function LoginInner() {
   const [email, setEmail] = useState('');
-  const [pass, setPass] = useState('');
+  const [pass, setPass]   = useState('');
   const [error, setError] = useState('');
   const router = useRouter();
   const sp = useSearchParams();
   const next = sp.get('next') || '/';
 
-  async function doLogin(e: React.FormEvent){
+  async function doLogin(e: React.FormEvent) {
     e.preventDefault(); setError('');
-    try{
+    try {
       await signInWithEmailAndPassword(auth, email, pass);
       router.replace(next);
-    }catch(err: unknown){
+    } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
     }
@@ -33,5 +33,13 @@ export default function Login(){
         <button className="w-full bg-emerald-600 text-white rounded p-2 font-bold">Entrar</button>
       </form>
     </div>
+  );
+}
+
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<div className="p-6">Cargando…</div>}>
+      <LoginInner />
+    </Suspense>
   );
 }
