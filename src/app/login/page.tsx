@@ -2,20 +2,22 @@
 import { signInWithEmailAndPassword } from 'firebase/auth';
 import { auth } from '@/lib/firebase';
 import { useState } from 'react';
-import { useRouter } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 
-export default function Login() {
+export default function Login(){
   const [email, setEmail] = useState('');
   const [pass, setPass] = useState('');
   const [error, setError] = useState('');
   const router = useRouter();
+  const sp = useSearchParams();
+  const next = sp.get('next') || '/';
 
-  async function doLogin(e: React.FormEvent) {
+  async function doLogin(e: React.FormEvent){
     e.preventDefault(); setError('');
-    try {
+    try{
       await signInWithEmailAndPassword(auth, email, pass);
-      router.push('/');
-    } catch (err: unknown) {
+      router.replace(next);
+    }catch(err: unknown){
       const msg = err instanceof Error ? err.message : String(err);
       setError(msg);
     }

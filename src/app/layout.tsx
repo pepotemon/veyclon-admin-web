@@ -2,6 +2,7 @@ import './globals.css';
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import Providers from './providers';
+import UserBox from './UserBox'; // ← AÑADIDO
 
 export const metadata: Metadata = {
   title: 'Veyclon Clientes Admin',
@@ -25,6 +26,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
               <Link href="/auditoria">Auditoría</Link>
               <Link href="/usuarios">Usuarios</Link>
             </nav>
+
+            {/* Bloque de usuario + botón Cerrar sesión */}
+            <UserBox /> {/* ← AÑADIDO */}
           </aside>
 
           {/* Todo lo que necesite hooks/client va envuelto en Providers */}
