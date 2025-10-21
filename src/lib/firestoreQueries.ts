@@ -1,5 +1,6 @@
 import {
   collection,
+  collectionGroup,
   onSnapshot,
   orderBy,
   query,
@@ -27,14 +28,14 @@ export type MovimientoCaja = {
   id: string;
   tenantId: string;
   admin?: string;             // cobrador
-  rutaId?: string;
+  rutaId?: string | null;
   // tipoReal = lo que viene del documento (p. ej. "gasto_admin")
   tipo: string;
   monto: number;
   operationalDate: string;    // YYYY-MM-DD
-  createdAt?: any;
+  createdAt?: unknown;
   clienteId?: string;
-  clienteNombre?: string | null; // ← NUEVO: para UI sin IDs
+  clienteNombre?: string | null;
   prestamoId?: string;
 };
 
@@ -87,7 +88,9 @@ export function buildCajaQuery(opts: {
     orderBy('operationalDate', 'asc'),
   ];
   if (opts.cobradorId) qc.push(where('admin', '==', opts.cobradorId));
-  if (opts.rutaId) qc.push(where('rutaId', '==', opts.rutaId));
+  if (opts.rutaId !== undefined && opts.rutaId !== null) {
+    qc.push(where('rutaId', '==', opts.rutaId));
+  }
   return query(collection(db, 'cajaDiaria'), ...qc);
 }
 
@@ -106,7 +109,9 @@ function prevYYYYMMDD(yyyyMmDd: string): string {
 }
 
 /** Calcula el cierre (cajaFinal) de un día exacto (una sola fecha) con la misma lógica de filtros,
- *  pero asegurando incluir gasto_admin aunque no tenga rutaId. */
+ *  + incluye gasto_admin sin ruta (cuando se filtra por ruta)
+ *  + incluye préstamos DEMO (source='demo') aunque no tengan ruta.
+ */
 async function getDayClosing(opts: {
   tenantId: string;
   date: string; // YYYY-MM-DD
@@ -119,10 +124,10 @@ async function getDayClosing(opts: {
     from: opts.date,
     to: opts.date,
     cobradorId: opts.cobradorId,
-    rutaId: opts.rutaId,
+    rutaId: opts.rutaId ?? undefined,
   });
 
-  // Si hay rutaId, agregamos query EXTRA para gasto_admin sin ruta
+  // Extra 1: gasto_admin sin ruta cuando se filtra por ruta
   let extraDocs: DocumentData[] = [];
   if (opts.rutaId) {
     const qcExtra: QueryConstraint[] = [
@@ -138,31 +143,51 @@ async function getDayClosing(opts: {
     extraDocs = snapExtra.docs.map((d) => d.data());
   }
 
+  // Extra 2: préstamos DEMO del día (siempre se incluyen)
+  const cgConstraints: QueryConstraint[] = [
+    where('tenantId', '==', opts.tenantId),
+    where('fechaInicio', '>=', opts.date),
+    where('fechaInicio', '<=', opts.date),
+    where('source', '==', 'demo'),
+    orderBy('fechaInicio', 'asc'),
+  ];
+  if (opts.cobradorId) cgConstraints.push(where('creadoPor', '==', opts.cobradorId));
+  const qPrestDemo = query(collectionGroup(db, 'prestamos'), ...cgConstraints);
+  const snapPrestDemo = await getDocs(qPrestDemo);
+  const demoDocs = snapPrestDemo.docs.map((d) => ({ ...d.data(), __kind: 'prest_demo' } as DocumentData));
+
   const snap = await getDocs(qMain);
 
   let inicial = 0, cobrado = 0, prestado = 0, gastos = 0, ingresos = 0, retiros = 0;
-  const allDocs: DocumentData[] = [...snap.docs.map((d) => d.data() as DocumentData), ...extraDocs];
+  const allDocs: DocumentData[] = [
+    ...snap.docs.map((d) => d.data() as DocumentData),
+    ...extraDocs,
+    ...demoDocs,
+  ];
 
   for (const d of allDocs) {
-    const ct = canonicalTipo(String(d.tipo ?? ''));
+    const isPrestamoDemo = (d as DocumentData).__kind === 'prest_demo';
+    const ct = isPrestamoDemo ? 'prestamo' : canonicalTipo(String((d as DocumentData).tipo ?? ''));
     if (!ct) continue;
-    const monto = Number(d.monto ?? 0);
+
+    const monto = isPrestamoDemo
+      ? Number((d as DocumentData).totalPrestamo ?? (d as DocumentData).montoTotal ?? 0)
+      : Number((d as DocumentData).monto ?? 0);
+
     if (ct === 'apertura') inicial += monto;
     else if (ct === 'abono') cobrado += monto;
     else if (ct === 'prestamo') prestado += monto;
-    else if (ct === 'gasto') gastos += monto;     // solo gasto_admin
-    else if (ct === 'ingreso') ingresos += monto; // ingreso*
-    else if (ct === 'retiro') retiros += monto;   // retiro*
+    else if (ct === 'gasto') gastos += monto;
+    else if (ct === 'ingreso') ingresos += monto;
+    else if (ct === 'retiro') retiros += monto;
   }
 
   return calcCajaFinal({ inicial, cobrado, ingresos, retiros, prestado, gastos });
 }
 
-/* ==========================================
-   Listener de movimientos + agregados global
-   + Arrastre de inicial desde día anterior.
-   + Inclusión de gasto_admin sin ruta cuando se filtra por ruta.
-========================================== */
+/* ==================================================================
+   Listener de movimientos + agregados (CAJA) con préstamos DEMO
+================================================================== */
 
 export function listenCajaMovimientos(
   opts: {
@@ -173,36 +198,44 @@ export function listenCajaMovimientos(
     rutaId?: string | null;
   },
   onData: (rows: MovimientoCaja[], agg: CajaAggregates) => void,
-  onError?: (e: any) => void
+  onError?: (e: unknown) => void
 ): Unsubscribe {
-  // Query principal (puede filtrar por rutaId)
-  const qMain = buildCajaQuery(opts);
+  // 1) cajaDiaria principal
+  const qMain = buildCajaQuery({
+    tenantId: opts.tenantId,
+    from: opts.from,
+    to: opts.to,
+    cobradorId: opts.cobradorId,
+    rutaId: opts.rutaId ?? undefined,
+  });
 
-  // Si hay rutaId, preparamos una query EXTRA para traer gasto_admin sin ruta
-  let unsubExtra: Unsubscribe | null = null;
-  const startExtraListener = () => {
-    if (!opts.rutaId) return null;
-    const qc: QueryConstraint[] = [
-      where('tenantId', '==', opts.tenantId),
-      where('operationalDate', '>=', opts.from),
-      where('operationalDate', '<=', opts.to),
-      where('tipo', '==', 'gasto_admin'),
-      orderBy('operationalDate', 'asc'),
-    ];
-    if (opts.cobradorId) qc.push(where('admin', '==', opts.cobradorId));
-    const qExtra = query(collection(db, 'cajaDiaria'), ...qc);
-    return onSnapshot(qExtra, () => {}, onError);
-  };
+  // 2) préstamos DEMO
+  const cgConstraints: QueryConstraint[] = [
+    where('tenantId', '==', opts.tenantId),
+    where('fechaInicio', '>=', opts.from),
+    where('fechaInicio', '<=', opts.to),
+    where('source', '==', 'demo'),
+    orderBy('fechaInicio', 'asc'),
+  ];
+  if (opts.cobradorId) cgConstraints.push(where('creadoPor', '==', opts.cobradorId));
+  const qPrestDemo = query(collectionGroup(db, 'prestamos'), ...cgConstraints);
 
-  // Variables para unir ambos streams
+  // caches
   let cacheMain: DocumentData[] = [];
-  let cacheExtra: DocumentData[] = [];
+  let cachePrest: DocumentData[] = [];
 
   const emit = async () => {
-    // Unimos docs (sin duplicar por id)
     const map = new Map<string, DocumentData>();
-    for (const d of cacheMain) map.set(d.__docId ?? `${d._id ?? ''}|${d.createdAtMs ?? Math.random()}`, d);
-    for (const d of cacheExtra) map.set(d.__docId ?? `${d._id ?? ''}|${d.createdAtMs ?? Math.random()}`, d);
+
+    // cajaDiaria
+    for (const d of cacheMain) map.set((d as DocumentData).__docId ?? `caja|${(d as DocumentData)._id ?? ''}|${(d as DocumentData).createdAtMs ?? Math.random()}`, d);
+
+    // prestamos demo
+    for (const d of cachePrest) map.set(
+      (d as DocumentData).__docId ?? `prest|${(d as DocumentData).prestamoId ?? ''}|${(d as DocumentData).createdAtMs ?? Math.random()}`,
+      d
+    );
+
     const docs = Array.from(map.values());
 
     // ---- Procesamiento con arrastre de inicial ----
@@ -220,40 +253,67 @@ export function listenCajaMovimientos(
     const byTipo: Record<string, number> = {};
     const byDate: Record<string, number> = {};
 
-    for (const d of docs) {
-      const realTipo = String(d.tipo ?? '');
-      const ct = canonicalTipo(realTipo);
+    for (const dd of docs) {
+      const d = dd as DocumentData;
+      const isPrestamoDemo = d.__kind === 'prest_demo';
+      const realTipo = String(d.tipo ?? '').toLowerCase();
+      const ct = isPrestamoDemo ? ('prestamo' as const) : canonicalTipo(realTipo);
       if (!ct) continue;
-      const monto = Number(d.monto ?? 0);
-      const day = String(d.operationalDate);
+
+      const monto = isPrestamoDemo
+        ? Number(d.totalPrestamo ?? d.montoTotal ?? 0)
+        : Number(d.monto ?? 0);
+
+      const day = isPrestamoDemo
+        ? String(d.fechaInicio)
+        : String(d.operationalDate);
+
+      const admin = isPrestamoDemo
+        ? (String(d.creadoPor ?? '').trim() || undefined)
+        : d.admin;
+
+      // Filtrado por cobrador seleccionado
+      if (opts.cobradorId && admin !== opts.cobradorId) continue;
+
+      // Filtrado por ruta:
+      // - prestamos demo NO tienen ruta -> siempre pasan
+      // - normales sí filtran por ruta si se especifica
+      const rId = isPrestamoDemo ? null : (d.rutaId ?? null);
+      if (opts.rutaId && !isPrestamoDemo && rId !== opts.rutaId) continue;
 
       rows.push({
-        id: d.__docId ?? `${d._id ?? ''}|${d.createdAtMs ?? Math.random()}`,
-        tenantId: d.tenantId,
-        admin: d.admin,
-        rutaId: d.rutaId,
-        tipo: realTipo,
+        id: d.__docId ?? `${isPrestamoDemo ? 'prest' : 'caja'}|${d._id ?? ''}|${d.createdAtMs ?? Math.random()}`,
+        tenantId: d.tenantId ?? opts.tenantId,
+        admin,
+        rutaId: rId,
+        tipo: isPrestamoDemo ? 'prestamo' : (d.tipo as string),
         monto,
         operationalDate: day,
         createdAt: d.createdAt,
         clienteId: d.clienteId,
-        clienteNombre: d.clienteNombre ?? d?.cliente?.nombre ?? null, // ← NUEVO
+        clienteNombre: isPrestamoDemo ? (d.clienteAlias ?? d.concepto ?? null) : (d.clienteNombre ?? d?.cliente?.nombre ?? null),
         prestamoId: d.prestamoId,
       });
 
       if (!byDay[day]) byDay[day] = { apertura: 0, cobrado: 0, prestado: 0, gastos: 0, ingresos: 0, retiros: 0 };
 
-      if (ct === 'apertura') byDay[day].apertura += monto;
-      else if (ct === 'abono') {
-        byDay[day].cobrado += monto;
-        byDate[day] = (byDate[day] ?? 0) + monto;
+      if (!isPrestamoDemo) {
+        // cajaDiaria
+        const cct = canonicalTipo(realTipo);
+        if (cct === 'apertura') byDay[day].apertura += monto;
+        else if (cct === 'abono') {
+          byDay[day].cobrado += monto;
+          byDate[day] = (byDate[day] ?? 0) + monto;
+        } else if (cct === 'prestamo') byDay[day].prestado += monto;
+        else if (cct === 'gasto') byDay[day].gastos += monto;       // solo gasto_admin
+        else if (cct === 'ingreso') byDay[day].ingresos += monto;   // ingreso*
+        else if (cct === 'retiro') byDay[day].retiros += monto;     // retiro*
+        if (cct) byTipo[cct] = (byTipo[cct] ?? 0) + monto;
+      } else {
+        // prest demo -> siempre suma a 'prestado'
+        byDay[day].prestado += monto;
+        byTipo['prestamo'] = (byTipo['prestamo'] ?? 0) + monto;
       }
-      else if (ct === 'prestamo') byDay[day].prestado += monto;
-      else if (ct === 'gasto') byDay[day].gastos += monto;       // solo gasto_admin
-      else if (ct === 'ingreso') byDay[day].ingresos += monto;   // ingreso*
-      else if (ct === 'retiro') byDay[day].retiros += monto;     // retiro*
-
-      byTipo[ct] = (byTipo[ct] ?? 0) + monto;
     }
 
     const daysSorted = Object.keys(byDay).sort(); // asc
@@ -274,7 +334,7 @@ export function listenCajaMovimientos(
       prevWithin = cierre;
     }
 
-    // Primer día sin apertura -> mirar día anterior
+    // Primer día sin apertura -> mirar día anterior (incluye demo y gasto_admin sin ruta)
     if (daysSorted.length > 0) {
       const firstDay = daysSorted[0];
       if (byDay[firstDay].apertura === 0 && inicialByDay[firstDay] === 0) {
@@ -284,7 +344,7 @@ export function listenCajaMovimientos(
             tenantId: opts.tenantId,
             date: prevDay,
             cobradorId: opts.cobradorId,
-            rutaId: opts.rutaId,
+            rutaId: opts.rutaId ?? undefined,
           });
 
           let runningPrev = prevClosing;
@@ -302,7 +362,9 @@ export function listenCajaMovimientos(
             });
             runningPrev = cierre;
           }
-        } catch { /* noop */ }
+        } catch {
+          /* noop */
+        }
       }
     }
 
@@ -330,37 +392,29 @@ export function listenCajaMovimientos(
     onError
   );
 
-  if (opts.rutaId) {
-    unsubExtra = onSnapshot(
-      query(
-        collection(db, 'cajaDiaria'),
-        where('tenantId', '==', opts.tenantId),
-        where('operationalDate', '>=', opts.from),
-        where('operationalDate', '<=', opts.to),
-        where('tipo', '==', 'gasto_admin'),
-        orderBy('operationalDate', 'asc'),
-        ...(opts.cobradorId ? [where('admin', '==', opts.cobradorId)] : [])
-      ),
-      (snap) => {
-        cacheExtra = snap.docs.map((doc) => ({ ...doc.data(), __docId: doc.id }) as DocumentData);
-        emit();
-      },
-      onError
-    );
-  }
+  const unsubPrest = onSnapshot(
+    qPrestDemo,
+    (snap) => {
+      cachePrest = snap.docs.map((doc) => ({
+        ...doc.data(),
+        __docId: doc.id,
+        __kind: 'prest_demo',
+      }) as DocumentData);
+      emit();
+    },
+    onError
+  );
 
   // Devuelve un unsub que cierra ambos listeners
   return () => {
     unsubMain();
-    if (unsubExtra) unsubExtra();
+    unsubPrest();
   };
 }
 
-/* ======================================
-   Agregados por día y por cobrador (UI Cierres)
-   + Arrastre de inicial en totales.
-   + Inclusión de gasto_admin sin ruta cuando se filtra por ruta.
-====================================== */
+/* ===========================================================
+   Agregados por día/cobrador (CIERRES) incluyendo préstamos DEMO
+=========================================================== */
 
 export type DailyAdminAgg = {
   adminId: string; // puede ser undefined -> mostramos '—'
@@ -388,31 +442,62 @@ export function listenCierresAggregates(
     cobradorId?: string | null;
   },
   onData: (days: DailySummary[]) => void,
-  onError?: (e: any) => void
+  onError?: (e: unknown) => void
 ): Unsubscribe {
   // Principal
-  const qMain = buildCajaQuery(opts);
+  const qMain = buildCajaQuery({
+    tenantId: opts.tenantId,
+    from: opts.from,
+    to: opts.to,
+    cobradorId: opts.cobradorId,
+    rutaId: opts.rutaId ?? undefined,
+  });
+
+  // Préstamos DEMO
+  const cgConstraints: QueryConstraint[] = [
+    where('tenantId', '==', opts.tenantId),
+    where('fechaInicio', '>=', opts.from),
+    where('fechaInicio', '<=', opts.to),
+    where('source', '==', 'demo'),
+    orderBy('fechaInicio', 'asc'),
+  ];
+  if (opts.cobradorId) cgConstraints.push(where('creadoPor', '==', opts.cobradorId));
+  const qPrestDemo = query(collectionGroup(db, 'prestamos'), ...cgConstraints);
 
   // Caches
   let cacheMain: DocumentData[] = [];
-  let cacheExtra: DocumentData[] = [];
+  let cachePrest: DocumentData[] = [];
 
   const emit = async () => {
     const map = new Map<string, DocumentData>();
-    for (const d of cacheMain) map.set(d.__docId ?? `${d._id ?? ''}|${d.createdAtMs ?? Math.random()}`, d);
-    for (const d of cacheExtra) map.set(d.__docId ?? `${d._id ?? ''}|${d.createdAtMs ?? Math.random()}`, d);
+    for (const d of cacheMain) map.set((d as DocumentData).__docId ?? `caja|${(d as DocumentData)._id ?? ''}|${(d as DocumentData).createdAtMs ?? Math.random()}`, d);
+    for (const d of cachePrest) map.set((d as DocumentData).__docId ?? `prest|${(d as DocumentData).prestamoId ?? ''}|${(d as DocumentData).createdAtMs ?? Math.random()}`, d);
     const docs = Array.from(map.values());
 
     const byDayAdmins: Record<string, Record<string, Omit<DailyAdminAgg, 'cajaFinal'|'adminId'>>> = {};
     const byDayTotals: Record<string, Omit<DailyAdminAgg, 'cajaFinal'|'adminId'>> = {};
     const aperturaByDay: Record<string, number> = {};
 
-    for (const d of docs) {
-      const day = String(d.operationalDate);
-      const admin = String(d.admin ?? '—');
-      const ct = canonicalTipo(String(d.tipo ?? ''));
+    for (const dd of docs) {
+      const d = dd as DocumentData;
+      const isPrestamoDemo = d.__kind === 'prest_demo';
+      const ct = isPrestamoDemo ? 'prestamo' : canonicalTipo(String(d.tipo ?? ''));
+
       if (!ct) continue;
-      const monto = Number(d.monto ?? 0);
+
+      const monto = isPrestamoDemo
+        ? Number(d.totalPrestamo ?? d.montoTotal ?? 0)
+        : Number(d.monto ?? 0);
+
+      const day = isPrestamoDemo ? String(d.fechaInicio) : String(d.operationalDate);
+      const admin = isPrestamoDemo ? String(d.creadoPor ?? '—') : String(d.admin ?? '—');
+
+      // filtros
+      if (opts.cobradorId && admin !== opts.cobradorId) continue;
+
+      // Con rutaId: prestamos demo también se contabilizan (no filtran por ruta)
+      const rId = isPrestamoDemo ? null : (d.rutaId ?? null);
+      if (opts.rutaId && !isPrestamoDemo && rId !== opts.rutaId) continue;
 
       if (!byDayAdmins[day]) byDayAdmins[day] = {};
       if (!byDayAdmins[day][admin]) byDayAdmins[day][admin] = { inicial: 0, cobrado: 0, prestado: 0, gastos: 0, ingresos: 0, retiros: 0 };
@@ -422,12 +507,17 @@ export function listenCierresAggregates(
       const A = byDayAdmins[day][admin];
       const T = byDayTotals[day];
 
-      if (ct === 'apertura') { A.inicial += monto; T.inicial += monto; aperturaByDay[day] += monto; }
-      else if (ct === 'abono') { A.cobrado += monto; T.cobrado += monto; }
-      else if (ct === 'prestamo') { A.prestado += monto; T.prestado += monto; }
-      else if (ct === 'gasto') { A.gastos += monto; T.gastos += monto; }       // SOLO gasto_admin
-      else if (ct === 'ingreso') { A.ingresos += monto; T.ingresos += monto; } // ingreso*
-      else if (ct === 'retiro') { A.retiros += monto; T.retiros += monto; }    // retiro*
+      if (!isPrestamoDemo) {
+        if (ct === 'apertura') { A.inicial += monto; T.inicial += monto; aperturaByDay[day] += monto; }
+        else if (ct === 'abono') { A.cobrado += monto; T.cobrado += monto; }
+        else if (ct === 'prestamo') { A.prestado += monto; T.prestado += monto; }
+        else if (ct === 'gasto') { A.gastos += monto; T.gastos += monto; }
+        else if (ct === 'ingreso') { A.ingresos += monto; T.ingresos += monto; }
+        else if (ct === 'retiro') { A.retiros += monto; T.retiros += monto; }
+      } else {
+        A.prestado += monto;
+        T.prestado += monto;
+      }
     }
 
     const daysSorted = Object.keys(byDayTotals).sort(); // asc
@@ -472,7 +562,7 @@ export function listenCierresAggregates(
             tenantId: opts.tenantId,
             date: prevDay,
             cobradorId: opts.cobradorId,
-            rutaId: opts.rutaId,
+            rutaId: opts.rutaId ?? undefined,
           });
 
           let runningPrev = closing;
@@ -489,7 +579,9 @@ export function listenCierresAggregates(
               cajaFinal: calcCajaFinal(a),
             }));
           }
-        } catch { /* noop */ }
+        } catch {
+          /* noop */
+        }
       }
     }
 
@@ -507,29 +599,21 @@ export function listenCierresAggregates(
     onError
   );
 
-  // Extra sólo si hay rutaId
-  let unsubExtra: Unsubscribe | null = null;
-  if (opts.rutaId) {
-    unsubExtra = onSnapshot(
-      query(
-        collection(db, 'cajaDiaria'),
-        where('tenantId', '==', opts.tenantId),
-        where('operationalDate', '>=', opts.from),
-        where('operationalDate', '<=', opts.to),
-        where('tipo', '==', 'gasto_admin'),
-        orderBy('operationalDate', 'asc'),
-        ...(opts.cobradorId ? [where('admin', '==', opts.cobradorId)] : [])
-      ),
-      (snap) => {
-        cacheExtra = snap.docs.map((doc) => ({ ...doc.data(), __docId: doc.id }) as DocumentData);
-        emit();
-      },
-      onError
-    );
-  }
+  const unsubPrest = onSnapshot(
+    qPrestDemo,
+    (snap) => {
+      cachePrest = snap.docs.map((doc) => ({
+        ...doc.data(),
+        __docId: doc.id,
+        __kind: 'prest_demo',
+      }) as DocumentData);
+      emit();
+    },
+    onError
+  );
 
   return () => {
     unsubMain();
-    if (unsubExtra) unsubExtra();
+    unsubPrest();
   };
 }

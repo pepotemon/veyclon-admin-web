@@ -44,7 +44,7 @@ export default function CajaPage() {
         setRows(r);
         setAgg(a);
       },
-      (e) => setError(e?.message || String(e))
+      (e) => setError((e as { message?: string })?.message || String(e))
     );
     return () => unsub();
   }, [tenantId, from, to, rutaId, cobradorId]);
@@ -89,7 +89,7 @@ export default function CajaPage() {
 
       {/* Tabla de movimientos */}
       <div className="overflow-auto rounded-xl border bg-white">
-        <table className="min-w-[720px] w-full text-sm">
+        <table className="min-w-[800px] w-full text-sm">
           <thead className="bg-slate-50">
             <tr className="text-left">
               <Th>Fecha</Th>
@@ -101,32 +101,23 @@ export default function CajaPage() {
             </tr>
           </thead>
           <tbody>
-            {rows.length === 0 && (
+            {rows.length === 0 ? (
               <tr>
                 <td colSpan={6} className="p-4 text-center text-slate-500">
                   Sin movimientos en el rango seleccionado.
                 </td>
               </tr>
-            )}
-            {rows.map((r) => {
-              // Nombre de cliente sin IDs (tolerante a distintos esquemas)
-              const clienteNombre =
-                (r as any).clienteNombre ??
-                (r as any).cliente?.nombre ??
-                (r as any).cliente?.displayName ??
-                null;
-
-              return (
-                <tr key={r.id} className="border-t">
-                  <Td>{r.operationalDate}</Td>
-                  <Td className="capitalize">{r.tipo}</Td>
-                  <Td mono>{fmtMoney(r.monto)}</Td>
-                  <Td>{r.admin ?? '—'}</Td>
-                  <Td>{r.rutaId ?? '—'}</Td>
-                  <Td>{clienteNombre ?? '—'}</Td>
-                </tr>
-              );
-            })}
+            ) : null}
+            {rows.map((r) => (
+              <tr key={r.id} className="border-t">
+                <Td>{r.operationalDate}</Td>
+                <Td className="capitalize">{r.tipo}</Td>
+                <Td mono>{fmtMoney(r.monto)}</Td>
+                <Td>{r.admin ?? '—'}</Td>
+                <Td>{r.rutaId ?? '—'}</Td>
+                <Td>{r.clienteNombre ?? '—'}</Td>
+              </tr>
+            ))}
           </tbody>
         </table>
       </div>
