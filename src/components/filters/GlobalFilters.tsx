@@ -105,7 +105,7 @@ export default function GlobalFilters() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hydrated, tz]);
 
-  // 3) Cargar/escuchar pares desde cajaDiaria y **unificar DEMO+RUTA por admin**
+  // 3) Cargar/escuchar pares {rutaId, admin} desde cajaDiaria (en vivo) y unificar DEMO+RUTA por admin
   React.useEffect(() => {
     if (!tenantId || !from || !to) return;
 
@@ -121,14 +121,14 @@ export default function GlobalFilters() {
     const unsub = onSnapshot(
       qCaja,
       async (snap) => {
-        // Mapa por ADMIN: priorizamos ruta real si existe; si no, quedamos con DEMO (rutaId=null)
-        const byAdmin = new Map<string, Pair>(); // key: admin -> Pair {rutaId|null, admin}
+        // Unificamos por admin: si tiene ruta real, se queda esa; si sólo hay demo, queda DEMO.
+        const byAdmin = new Map<string, Pair>(); // admin -> Pair
+
         snap.forEach((doc) => {
           const d = doc.data() as DocumentData;
           const admin = String(d.admin ?? '').trim();
           if (!admin) return;
 
-          // ruta puede ser nula/vacía (demo)
           const ruta: string | null =
             d.rutaId === null || d.rutaId === undefined || String(d.rutaId).trim() === ''
               ? null
@@ -138,15 +138,13 @@ export default function GlobalFilters() {
           const existing = byAdmin.get(admin);
           if (!existing) {
             byAdmin.set(admin, { rutaId: ruta, admin, source });
-          } else {
-            // Si ya hay DEMO (null) y llega una ruta real -> reemplazamos.
-            if (existing.rutaId === null && ruta) {
-              byAdmin.set(admin, { rutaId: ruta, admin, source });
-            }
+          } else if (existing.rutaId === null && ruta) {
+            // Si antes era DEMO (sin ruta) y ahora aparece ruta real, reemplazamos.
+            byAdmin.set(admin, { rutaId: ruta, admin, source });
           }
         });
 
-        // Fallback opcional desde usuarios si no hay nada en el rango
+        // Fallback opcional si no hay datos en el rango: traer usuarios (con ruta definida) para poblar el selector
         try {
           if (byAdmin.size === 0) {
             const usersSnap = await getDocs(
@@ -156,17 +154,16 @@ export default function GlobalFilters() {
               const data = d.data() as DocumentData;
               const admin = String(data.displayName || data.nombre || data.email || d.id).trim();
               const ruta = String(data.rutaId || '').trim();
-              if (!admin) return;
-              if (byAdmin.has(admin)) return;
-              if (!ruta) return;
-              byAdmin.set(admin, { rutaId: ruta, admin, source: null });
+              if (!admin || !ruta) return;
+              if (!byAdmin.has(admin)) {
+                byAdmin.set(admin, { rutaId: ruta, admin, source: null });
+              }
             });
           }
         } catch {
           /* noop */
         }
 
-        // Construir opciones (una por admin)
         const opts: Option[] = Array.from(byAdmin.values()).map((p) => ({
           id: (p.rutaId ? `${p.rutaId}` : '__demo__') + '||' + p.admin,
           rutaId: p.rutaId ?? null,
@@ -186,9 +183,16 @@ export default function GlobalFilters() {
   }, [tenantId, from, to]);
 
   // 4) Propagar cambios a URL (debounce)
+  type UrlPayload = {
+    from?: string;
+    to?: string;
+    rutaId?: string | null;
+    cobradorId?: string | null;
+  };
+
   const writeUrlDebounced = React.useRef(
     debounce(
-      (payload: { from?: string; to?: string; rutaId?: string | null; cobradorId?: string | null }) => {
+      (payload: UrlPayload) => {
         const qs = new URLSearchParams(window.location.search);
         if (payload.from) qs.set('from', payload.from);
         if (payload.to) qs.set('to', payload.to);
@@ -216,7 +220,7 @@ export default function GlobalFilters() {
 
   // ✅ Aplicar selección combinada (rutaId + cobradorId)
   const applySelection = (opt: Option | null) => {
-    const nextRuta = opt?.rutaId ?? null; // si es demo -> null; si es ruta -> la ruta
+    const nextRuta = opt?.rutaId ?? null; // demo => null
     const nextAdmin = opt?.admin ?? null;
     setRutaId(nextRuta);
     setCobradorId(nextAdmin);
@@ -230,18 +234,13 @@ export default function GlobalFilters() {
     return options.filter((o) => o.label.toLowerCase().includes(q));
   }, [options, queryText]);
 
-  // Texto del input
+  // Texto del input: label seleccionado si está cerrado, texto de búsqueda si está abierto
   const currentLabel = React.useMemo(() => {
-    // 1) match exacto rutaId+admin
-    let match = options.find(
+    const match = options.find(
       (o) =>
         (o.rutaId ?? null) === (rutaId ?? null) &&
         (o.admin || '') === (cobradorId || '')
     );
-    // 2) fallback por admin (si cambió de DEMO→ruta y store aún tiene null)
-    if (!match && cobradorId) {
-      match = options.find((o) => o.admin === cobradorId);
-    }
     return match?.label ?? '';
   }, [options, rutaId, cobradorId]);
 
@@ -286,7 +285,7 @@ export default function GlobalFilters() {
             <label className="text-xs text-neutral-500">Ruta / Cobrador</label>
             <div className="relative">
               <input
-                placeholder={loadingOpts ? 'Cargando…' : 'Selecciona o busca (p. ej. 32323 / Pedro)'}
+                placeholder={loadingOpts ? 'Cargando…' : 'Selecciona o busca (p. ej. 32323 / Pedro o DEMO / Carlos)'}
                 value={open ? queryText : currentLabel}
                 onChange={(e) => {
                   setQueryText(e.target.value);
@@ -297,7 +296,7 @@ export default function GlobalFilters() {
               />
 
               {/* Limpiar selección */}
-              {(rutaId !== null || cobradorId) && !open ? (
+              {((rutaId !== null) || !!cobradorId) && !open ? (
                 <button
                   type="button"
                   onClick={() => applySelection(null)}
@@ -360,13 +359,22 @@ export default function GlobalFilters() {
 
 // --- helpers ---
 function buildPairLabel(p: Pair) {
-  if (!p.rutaId) return `DEMO / ${p.admin}`;
-  return `${p.rutaId} / ${p.admin}`;
+  // Si es demo sin ruta, muestra "DEMO / admin"
+  if (!p.rutaId && p.source === 'demo') return `DEMO / ${p.admin}`;
+  // Normal: "rutaId / admin"
+  if (p.rutaId && p.admin) return `${p.rutaId} / ${p.admin}`;
+  if (p.rutaId) return `${p.rutaId}`;
+  if (p.admin) return `${p.admin}`;
+  return '—';
 }
 
-function debounce<T extends (...args: any[]) => void>(fn: T, ms = 200) {
+// debounce tipado por tupla, sin `any`
+function debounce<TArgs extends unknown[]>(
+  fn: (...args: TArgs) => void,
+  ms = 200
+) {
   let t: ReturnType<typeof setTimeout> | null = null;
-  return (...args: Parameters<T>) => {
+  return (...args: TArgs) => {
     if (t) clearTimeout(t);
     t = setTimeout(() => fn(...args), ms);
   };
