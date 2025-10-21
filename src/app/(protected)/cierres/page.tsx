@@ -1,161 +1,137 @@
 'use client';
 
 import * as React from 'react';
+import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { useAuthStore } from '@/store/useAuthStore';
 import { useFiltersStore } from '@/store/useFiltersStore';
 import {
   listenCierresAggregates,
   type DailySummary,
+  calcCajaFinal,
 } from '@/lib/firestoreQueries';
 
-function fmt(n: number) {
+function fmtMoney(n: number) {
   return n.toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
 }
 
 export default function CierresPage() {
+  const search = useSearchParams();
+  const dateParam = search.get('date') || undefined;
+
   const { tenantId } = useAuthStore();
   const from = useFiltersStore((s) => s.from);
-  const to = useFiltersStore((s) => s.to);
+  const to   = useFiltersStore((s) => s.to);
   const rutaId = useFiltersStore((s) => s.rutaId);
   const cobradorId = useFiltersStore((s) => s.cobradorId);
-  const sp = useSearchParams();
-  const dateParam = sp.get('date'); // si viene desde Caja → ?date=YYYY-MM-DD
 
   const [days, setDays] = React.useState<DailySummary[]>([]);
   const [error, setError] = React.useState<string>('');
-  const [expanded, setExpanded] = React.useState<Record<string, boolean>>({});
 
   React.useEffect(() => {
     if (!tenantId || !from || !to) return;
+
     setError('');
     const unsub = listenCierresAggregates(
-      { tenantId, from, to, rutaId, cobradorId },
-      (items) => {
-        setDays(items);
-        // Si viene dateParam, expandimos ese día por defecto
-        if (dateParam) {
-          setExpanded((prev) => ({ ...prev, [dateParam]: true }));
-        }
+      {
+        tenantId,
+        from: dateParam ?? from,
+        to:   dateParam ?? to,
+        rutaId,
+        cobradorId,
       },
-      (e) => setError(e?.message || String(e))
+      (d) => setDays(d),
+      (e: unknown) => {
+        // Manejo seguro del error (evita 'Property message does not exist on type {}')
+        const msg = e instanceof Error ? e.message : String(e);
+        setError(msg);
+      }
     );
+
     return () => unsub();
   }, [tenantId, from, to, rutaId, cobradorId, dateParam]);
-
-  const list = React.useMemo(() => {
-    if (!dateParam) return days;
-    return days.filter((d) => d.date === dateParam);
-  }, [days, dateParam]);
 
   return (
     <div className="space-y-5">
       <header className="flex items-center justify-between">
         <h2 className="text-xl font-bold">Cierres</h2>
-        <div className="text-xs text-slate-600">
-          Rango: <span className="font-mono">{from}</span> → <span className="font-mono">{to}</span>
-          {rutaId && <> · Ruta: <span className="font-mono">{rutaId}</span></>}
-          {cobradorId && <> · Cobrador: <span className="font-mono">{cobradorId}</span></>}
-        </div>
+        {dateParam ? (
+          <Link
+            href="/caja"
+            className="px-3 py-2 rounded-lg bg-slate-700 text-white text-sm font-bold"
+          >
+            Volver a Caja
+          </Link>
+        ) : null}
       </header>
 
-      {error && (
+      {error ? (
         <div className="rounded-lg border border-red-200 bg-red-50 text-red-700 p-3">
           {error}
         </div>
-      )}
+      ) : null}
 
-      {list.length === 0 && (
-        <div className="rounded-lg border bg-white p-4 text-slate-500">
+      {days.length === 0 ? (
+        <div className="rounded-lg border bg-white p-4 text-slate-600">
           No hay cierres en el rango seleccionado.
         </div>
-      )}
-
-      <div className="space-y-4">
-        {list.map((d) => {
-          const isOpen = !!expanded[d.date];
-          return (
+      ) : (
+        <div className="space-y-4">
+          {days.map((d) => (
             <section key={d.date} className="rounded-xl border bg-white">
-              <button
-                onClick={() => setExpanded((s) => ({ ...s, [d.date]: !s[d.date] }))}
-                className="w-full flex items-center justify-between p-4"
-              >
-                <div className="flex flex-col items-start">
-                  <div className="text-sm text-slate-500">{d.date}</div>
-                  <div className="text-[13px] text-slate-500">
-                    Caja Final Total:{' '}
-                    <b className="text-slate-800">{fmt(d.totals.cajaFinal)}</b>
-                    {' · '}Cobrado: <b>{fmt(d.totals.cobrado)}</b>
-                    {' · '}Prestado: <b>{fmt(d.totals.prestado)}</b>
-                    {' · '}Gastos: <b>{fmt(d.totals.gastos)}</b>
-                  </div>
+              <div className="px-4 py-3 border-b flex items-center justify-between">
+                <div className="font-bold">{d.date}</div>
+                <div className="text-sm text-slate-500">
+                  Caja final (total): <span className="font-semibold">{fmtMoney(d.totals.cajaFinal)}</span>
                 </div>
-                <span className="text-xs font-semibold text-emerald-700">
-                  {isOpen ? 'Ocultar' : 'Ver detalle'}
-                </span>
-              </button>
+              </div>
 
-              {isOpen && (
-                <div className="border-t">
-                  <div className="overflow-auto">
-                    <table className="min-w-[900px] w-full text-sm">
-                      <thead className="bg-slate-50">
-                        <tr className="text-left">
-                          <Th>Cobrador</Th>
-                          <Th>Inicial</Th>
-                          <Th>Cobrado</Th>
-                          <Th>Prestado</Th>
-                          <Th>Ingresos</Th>
-                          <Th>Retiros</Th>
-                          <Th>Gastos</Th>
-                          <Th>Caja Final</Th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {d.admins.length === 0 && (
-                          <tr>
-                            <td colSpan={8} className="p-4 text-center text-slate-500">
-                              Sin datos de cobradores.
-                            </td>
-                          </tr>
-                        )}
-                        {d.admins.map((a) => (
-                          <tr key={a.adminId} className="border-t">
-                            <Td>{a.adminId}</Td>
-                            <Td mono>{fmt(a.inicial)}</Td>
-                            <Td mono>{fmt(a.cobrado)}</Td>
-                            <Td mono>{fmt(a.prestado)}</Td>
-                            <Td mono>{fmt(a.ingresos)}</Td>
-                            <Td mono>{fmt(a.retiros)}</Td>
-                            <Td mono>{fmt(a.gastos)}</Td>
-                            <Td mono className="font-semibold">{fmt(a.cajaFinal)}</Td>
-                          </tr>
-                        ))}
-                        {/* Totales fila */}
-                        <tr className="border-t bg-slate-50/70">
-                          <Td className="font-semibold">TOTAL</Td>
-                          <Td mono className="font-semibold">{fmt(d.totals.inicial)}</Td>
-                          <Td mono className="font-semibold">{fmt(d.totals.cobrado)}</Td>
-                          <Td mono className="font-semibold">{fmt(d.totals.prestado)}</Td>
-                          <Td mono className="font-semibold">{fmt(d.totals.ingresos)}</Td>
-                          <Td mono className="font-semibold">{fmt(d.totals.retiros)}</Td>
-                          <Td mono className="font-semibold">{fmt(d.totals.gastos)}</Td>
-                          <Td mono className="font-semibold">{fmt(d.totals.cajaFinal)}</Td>
-                        </tr>
-                      </tbody>
-                    </table>
-                  </div>
+              <div className="overflow-auto">
+                <table className="min-w-[720px] w-full text-sm">
+                  <thead className="bg-slate-50">
+                    <tr className="text-left">
+                      <Th>Admin</Th>
+                      <Th>Inicial</Th>
+                      <Th>Cobrado</Th>
+                      <Th>Prestado</Th>
+                      <Th>Ingresos</Th>
+                      <Th>Gastos</Th>
+                      <Th>Retiros</Th>
+                      <Th>Caja Final</Th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {d.admins.map((a) => (
+                      <tr key={a.adminId} className="border-t">
+                        <Td>{a.adminId}</Td>
+                        <Td mono>{fmtMoney(a.inicial)}</Td>
+                        <Td mono>{fmtMoney(a.cobrado)}</Td>
+                        <Td mono>{fmtMoney(a.prestado)}</Td>
+                        <Td mono>{fmtMoney(a.ingresos)}</Td>
+                        <Td mono>{fmtMoney(a.gastos)}</Td>
+                        <Td mono>{fmtMoney(a.retiros)}</Td>
+                        <Td mono className="font-semibold">{fmtMoney(a.cajaFinal)}</Td>
+                      </tr>
+                    ))}
 
-                  {/* Nota / fórmula */}
-                  <div className="p-3 text-[12px] text-slate-500">
-                    Fórmula: cajaFinal = inicial + cobrado + ingresos - retiros - prestado - gastos
-                  </div>
-                </div>
-              )}
+                    {/* Totales del día */}
+                    <tr className="border-t bg-slate-50 font-semibold">
+                      <Td>Total</Td>
+                      <Td mono>{fmtMoney(d.totals.inicial)}</Td>
+                      <Td mono>{fmtMoney(d.totals.cobrado)}</Td>
+                      <Td mono>{fmtMoney(d.totals.prestado)}</Td>
+                      <Td mono>{fmtMoney(d.totals.ingresos)}</Td>
+                      <Td mono>{fmtMoney(d.totals.gastos)}</Td>
+                      <Td mono>{fmtMoney(d.totals.retiros)}</Td>
+                      <Td mono>{fmtMoney(d.totals.cajaFinal)}</Td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </section>
-          );
-        })}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
